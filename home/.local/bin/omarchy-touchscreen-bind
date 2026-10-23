@@ -1,0 +1,72 @@
+#!/bin/bash
+
+# Keep a built-in touchscreen and pen mapped to the built-in display even when
+# an external monitor has keyboard focus. An explicit output can be supplied as
+# the first argument for unusual connector names.
+
+set -euo pipefail
+
+detect_output_from_sysfs() {
+  local connector name
+  for connector in /sys/class/drm/card*-eDP-* /sys/class/drm/card*-LVDS-* /sys/class/drm/card*-DSI-*; do
+    [[ -r $connector/status && $(<"$connector/status") == connected ]] || continue
+    name=${connector##*/}
+    echo "${name#card*-}"
+    return
+  done
+}
+
+detect_output() {
+  local monitors output
+  if command -v hyprctl >/dev/null && command -v jq >/dev/null &&
+    monitors=$(hyprctl monitors all -j 2>/dev/null); then
+    output=$(jq -r '
+      [ .[]
+        | select(.disabled == false)
+        | select(.name | test("^(eDP|LVDS|DSI)-"))
+        | .name
+      ][0] // empty
+    ' <<<"$monitors")
+    if [[ -n $output ]]; then
+      echo "$output"
+      return
+    fi
+  fi
+  detect_output_from_sysfs
+}
+
+if [[ ${1:-} == --print-output ]]; then
+  # Config evaluation runs inside Hyprland, so asking hyprctl here would
+  # deadlock until its IPC timeout. Kernel connector state is sufficient.
+  detect_output_from_sysfs
+  exit 0
+fi
+
+output=${1:-$(detect_output)}
+
+if [[ -z $output ]]; then
+  echo "No active built-in display (eDP/LVDS/DSI) was found; touchscreen mapping was left unchanged." >&2
+  exit 0
+fi
+
+if ! command -v hyprctl >/dev/null || ! command -v jq >/dev/null; then
+  exit 0
+fi
+
+devices=$(hyprctl devices -j 2>/dev/null) || exit 0
+touch_count=$(jq '(.touch // []) | length' <<<"$devices")
+if ((touch_count == 0)); then
+  exit 0
+fi
+
+hyprctl keyword input:touchdevice:output "$output" >/dev/null
+
+# Pens commonly share the same digitizer and need the same monitor mapping.
+tablet_count=$(jq '(.tablets // []) | length' <<<"$devices")
+if ((tablet_count > 0)); then
+  hyprctl keyword input:tablet:output "$output" >/dev/null
+  echo "Mapped touchscreen and pen to $output"
+else
+  echo "Mapped touchscreen to $output"
+fi
+
